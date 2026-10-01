@@ -1,0 +1,145 @@
+## ---------------------------------------------------------------------------
+## Oras BLE valve — STEP 1: DISCOVERY
+##
+## Flash this first. It listens for Oras advertisements and prints the three
+## values you need for the real firmware:
+##
+##   unit_mac   the control unit (the box on the valve)
+##   pad_mac    the press pad (the button on the worktop)
+##   pair_id    the 4-byte ID that ties your pad to your control unit
+##
+## The pair_id only appears while the pad is transmitting, so you MUST press
+## the physical pad while this is running.
+##
+## This firmware only listens. It never transmits and cannot move the valve.
+##
+## Needs oras_includes.h in the same folder.
+## ---------------------------------------------------------------------------
+
+esphome:
+  name: oras-discovery
+  friendly_name: Oras Discovery
+  includes:
+    - oras_includes.h
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  logs:
+    esp32_ble: ERROR          # silences a harmless "GAP event type: 74" warning
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "oras-discovery fallback"
+
+captive_portal:
+
+## ---------------------------------------------------------------------------
+## Listen for anything advertising Oras manufacturer data (company 0x0131).
+##
+## No MAC filter here — that is the whole point, we do not know the addresses
+## yet. Frames are de-duplicated per device per frame-type, because the pad
+## repeats one frame every ~8 ms for up to ~4 seconds per press and logging
+## all of them would flood the BLE event queue.
+## ---------------------------------------------------------------------------
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+    interval: 320ms
+    window: 300ms
+    continuous: true
+
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            static std::map<std::string, std::vector<uint8_t>> seen;
+            static std::string found_unit;
+            static std::string found_pad;
+            static std::string found_pair;
+
+            auto want = esp32_ble_tracker::ESPBTUUID::from_uint16(0x0131);
+
+            for (auto md : x.get_manufacturer_datas()) {
+              if (!(md.uuid == want)) continue;
+              const auto &d = md.data;
+              if (d.size() < 3) continue;
+
+              std::string addr = x.address_str();
+              std::string key = addr + "#" + std::to_string((int) d[0]);
+
+              auto it = seen.find(key);
+              if (it != seen.end() && it->second == d) continue;
+              seen[key] = d;
+
+              // ---- 0x28: control unit status frame ----
+              if (d[0] == 0x28 && d.size() >= 13) {
+                bool open = (d[2] & 0x80) != 0;
+                std::string serial((const char *) d.data() + 3, 10);
+                found_unit = addr;
+                ESP_LOGI("discovery",
+                         "CONTROL UNIT  mac=%s  valve=%s  serial=%s  rssi=%d",
+                         addr.c_str(), open ? "OPEN" : "CLOSED",
+                         serial.c_str(), x.get_rssi());
+              }
+
+              // ---- 0x14: press pad idle frame ----
+              else if (d[0] == 0x14 && d.size() >= 13) {
+                std::string serial((const char *) d.data() + 3, 10);
+                found_pad = addr;
+                ESP_LOGI("discovery",
+                         "PRESS PAD     mac=%s  serial=%s  battery=0x%02X  rssi=%d",
+                         addr.c_str(), serial.c_str(), d[1], x.get_rssi());
+              }
+
+              // ---- 0x15: press pad command frame (carries the pair ID) ----
+              else if (d[0] == 0x15 && d.size() >= 18) {
+                uint8_t seq = d[3] >> 4;
+                uint16_t dur = (uint16_t) d[6] | ((uint16_t) d[7] << 8);
+                const char *cmd = (d[5] == 0x68) ? "open"
+                                : (d[5] == 0x69) ? "close" : "unknown";
+
+                char pair[9];
+                snprintf(pair, sizeof(pair), "%02X%02X%02X%02X",
+                         d[14], d[15], d[16], d[17]);
+
+                found_pad = addr;
+                found_pair = pair;
+
+                ESP_LOGI("discovery",
+                         "PAD COMMAND   mac=%s  cmd=%s  seq=%u  duration=%us  pair_id=%s",
+                         addr.c_str(), cmd, seq, dur, pair);
+              }
+
+              // ---- print a ready-to-paste block once we have everything ----
+              if (!found_unit.empty() && !found_pad.empty() && !found_pair.empty()) {
+                ESP_LOGI("discovery", " ");
+                ESP_LOGI("discovery", "=====================================================");
+                ESP_LOGI("discovery", "  ALL VALUES FOUND — paste this into your config:");
+                ESP_LOGI("discovery", " ");
+                ESP_LOGI("discovery", "  substitutions:");
+                ESP_LOGI("discovery", "    unit_mac: \"%s\"", found_unit.c_str());
+                ESP_LOGI("discovery", "    pad_mac:  \"%s\"", found_pad.c_str());
+                ESP_LOGI("discovery", "    pair_id:  \"%s\"", found_pair.c_str());
+                ESP_LOGI("discovery", "=====================================================");
+                ESP_LOGI("discovery", " ");
+              }
+            }
+
+text_sensor:
+  - platform: version
+    name: "ESPHome version"
+    entity_category: diagnostic

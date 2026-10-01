@@ -1,0 +1,326 @@
+## ---------------------------------------------------------------------------
+## Oras BLE valve — STEP 2: CONTROL
+##
+## Reads the control unit's broadcast state and transmits command frames as
+## the press pad, giving Home Assistant a switch that opens and closes the
+## valve.
+##
+## Fill in the three substitutions below from the discovery firmware output.
+## Everything else works unchanged.
+##
+## Needs oras_includes.h in the same folder.
+## ---------------------------------------------------------------------------
+
+substitutions:
+  name: oras-valve
+  friendly_name: Oras Valve
+
+  ## ------ FILL THESE IN (see README, step 3) --------------------------------
+  unit_mac: "00:00:00:00:00:00"     # control unit
+  pad_mac:  "00:00:00:00:00:00"     # press pad
+  pair_id:  "00000000"              # 8 hex characters, no separators
+  ## --------------------------------------------------------------------------
+
+  ## How long the valve stays open by default, in seconds.
+  ## The control unit enforces this itself, so it is your safety net if
+  ## Home Assistant never sends the close command. 14400 = 4 hours.
+  default_duration: "14400"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  includes:
+    - oras_includes.h
+  on_boot:
+    priority: 1000
+    then:
+      - lambda: |-
+          // The control unit only accepts commands from its paired pad, so we
+          // must advertise from the pad's BLE address. The ESP32 derives its
+          // BLE address from the base MAC + 2, so set the base two below.
+          //
+          // NOTE: this also changes the WiFi MAC. If you use a DHCP
+          // reservation, reserve the address ending two BELOW the pad's.
+          unsigned int m[6];
+          if (sscanf("${pad_mac}", "%x:%x:%x:%x:%x:%x",
+                     &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+            uint8_t base[6];
+            for (int k = 0; k < 6; k++) base[k] = (uint8_t) m[k];
+            base[5] -= 2;
+            esp_base_mac_addr_set(base);
+          } else {
+            ESP_LOGE("oras", "pad_mac substitution is not a valid MAC address");
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      # Do NOT enable sram1_as_iram here, even though ESPHome suggests it in
+      # the log. It has been observed to cause a silent boot loop on this
+      # build, and the extra IRAM is not needed.
+      minimum_chip_revision: "3.1"
+
+logger:
+  level: INFO
+  logs:
+    esp32_ble: ERROR          # silences a harmless "GAP event type: 74" warning
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name} fallback"
+
+captive_portal:
+
+globals:
+  # The control unit ignores a command whose sequence number matches the last
+  # one it accepted, so we track it. Updated both when we transmit and when
+  # the real pad is heard, which keeps us from colliding with it.
+  - id: last_seq
+    type: uint8_t
+    restore_value: true
+    initial_value: '1'
+
+## ---------------------------------------------------------------------------
+## Receiving
+##
+## Both handlers de-duplicate on frame content. The pad repeats one frame
+## every ~8 ms for up to ~4 seconds per press; acting on each one overflows
+## the BLE event queue and the stack starts dropping packets.
+## ---------------------------------------------------------------------------
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+    interval: 320ms
+    window: 300ms
+    continuous: true
+
+  on_ble_advertise:
+    ## ---- CONTROL UNIT: the authoritative valve state ----
+    - mac_address: ${unit_mac}
+      then:
+        - lambda: |-
+            static std::vector<uint8_t> last_unit;
+            auto want = esp32_ble_tracker::ESPBTUUID::from_uint16(0x0131);
+            for (auto md : x.get_manufacturer_datas()) {
+              if (!(md.uuid == want)) continue;
+              const auto &d = md.data;
+              if (d.size() < 3 || d[0] != 0x28) continue;
+              if (d == last_unit) continue;
+              last_unit = d;
+
+              bool open = (d[2] & 0x80) != 0;
+              id(valve_open).publish_state(open);
+              id(unit_rssi).publish_state(x.get_rssi());
+              ESP_LOGI("oras", "UNIT %s  rssi=%d",
+                       open ? "OPEN" : "CLOSED", x.get_rssi());
+            }
+
+    ## ---- PRESS PAD: track its sequence so we never reuse the same value ----
+    - mac_address: ${pad_mac}
+      then:
+        - lambda: |-
+            static std::vector<uint8_t> last_pad;
+            auto want = esp32_ble_tracker::ESPBTUUID::from_uint16(0x0131);
+            for (auto md : x.get_manufacturer_datas()) {
+              if (!(md.uuid == want)) continue;
+              const auto &d = md.data;
+              if (d.size() < 2) continue;
+              if (d == last_pad) continue;
+              last_pad = d;
+
+              id(pad_batt).publish_state(d[1]);
+              if (d[0] != 0x15 || d.size() < 8) continue;
+
+              uint8_t seq = d[3] >> 4;
+              uint16_t dur = (uint16_t) d[6] | ((uint16_t) d[7] << 8);
+              std::string cmd = "unknown";
+              if (d[5] == 0x68) cmd = "open";
+              else if (d[5] == 0x69) cmd = "close";
+
+              id(last_seq) = seq;
+
+              id(pad_cmd).publish_state(cmd);
+              ESP_LOGI("oras", "PAD seq=%u cmd=%s duration=%us rssi=%d",
+                       seq, cmd.c_str(), dur, x.get_rssi());
+            }
+
+## ---------------------------------------------------------------------------
+## Transmitting
+## ---------------------------------------------------------------------------
+
+script:
+  - id: oras_tx
+    mode: restart
+    parameters:
+      cmd: int
+      dur: int
+    then:
+      - lambda: |-
+          // Sequence must DIFFER from the last value the unit accepted.
+          // Advance by one, wrapping 15 -> 1 (the pad never uses 0).
+          uint8_t seq = id(last_seq) + 1;
+          if (seq > 15 || seq == 0) seq = 1;
+          id(last_seq) = seq;
+
+          unsigned int p[4] = {0, 0, 0, 0};
+          if (sscanf("${pair_id}", "%2x%2x%2x%2x",
+                     &p[0], &p[1], &p[2], &p[3]) != 4) {
+            ESP_LOGE("oras", "pair_id substitution is not 8 hex characters");
+            return;
+          }
+
+          uint8_t adv[31];
+          int i = 0;
+          // AD: flags
+          adv[i++] = 0x02; adv[i++] = 0x01; adv[i++] = 0x06;
+          // AD: complete local name "ORA5" (the pad uses this for commands)
+          adv[i++] = 0x05; adv[i++] = 0x09;
+          adv[i++] = 'O'; adv[i++] = 'R'; adv[i++] = 'A'; adv[i++] = '5';
+          // AD: manufacturer data, company 0x0131, 18 bytes of payload
+          adv[i++] = 0x15; adv[i++] = 0xFF; adv[i++] = 0x31; adv[i++] = 0x01;
+
+          adv[i++] = 0x15;                        // frame type: command
+          adv[i++] = 0x5E;                        // battery proxy (cosmetic)
+          adv[i++] = 0x00;
+          adv[i++] = (uint8_t)((seq << 4) | 0x01);
+          adv[i++] = 0x00;
+          adv[i++] = (uint8_t) cmd;               // 0x68 open, 0x69 close
+          adv[i++] = (uint8_t)(dur & 0xFF);       // duration, uint16 LE
+          adv[i++] = (uint8_t)((dur >> 8) & 0xFF);
+          for (int k = 0; k < 6; k++) adv[i++] = 0x00;
+          adv[i++] = (uint8_t) p[0]; adv[i++] = (uint8_t) p[1];
+          adv[i++] = (uint8_t) p[2]; adv[i++] = (uint8_t) p[3];
+
+          ESP_LOGI("oras", "TX seq=%u cmd=0x%02x duration=%ds",
+                   seq, (unsigned) cmd, dur);
+
+          esp_err_t e1 = esp_ble_gap_config_adv_data_raw(adv, i);
+
+          static esp_ble_adv_params_t params;
+          params.adv_int_min       = 0x20;        // 20 ms
+          params.adv_int_max       = 0x20;
+          params.adv_type          = ADV_TYPE_IND;
+          params.own_addr_type     = BLE_ADDR_TYPE_PUBLIC;
+          params.channel_map       = ADV_CHNL_ALL;
+          params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+
+          esp_err_t e2 = esp_ble_gap_start_advertising(&params);
+          if (e1 != ESP_OK || e2 != ESP_OK) {
+            ESP_LOGW("oras", "TX setup failed: cfg=%d start=%d",
+                     (int) e1, (int) e2);
+          }
+      # Repeat for a few seconds, as the real pad does.
+      - delay: 3s
+      - lambda: |-
+          esp_ble_gap_stop_advertising();
+
+## ---------------------------------------------------------------------------
+## Controls
+## ---------------------------------------------------------------------------
+
+switch:
+  - platform: template
+    name: "Valve"
+    icon: mdi:water
+    # DISABLED is important: without it ESPHome restores "off" on every boot
+    # and fires turn_off_action, which would try to close the valve after
+    # each restart. The valve's real state is never ours to assume.
+    restore_mode: DISABLED
+    lambda: 'return id(valve_open).state;'
+    turn_on_action:
+      - script.execute:
+          id: oras_tx
+          cmd: 0x68
+          dur: !lambda 'return (int) id(open_duration).state;'
+    turn_off_action:
+      - script.execute:
+          id: oras_tx
+          cmd: 0x69
+          dur: 0
+
+number:
+  - platform: template
+    id: open_duration
+    name: "Open duration"
+    optimistic: true
+    restore_value: true
+    min_value: 300
+    max_value: 43200
+    step: 300
+    initial_value: ${default_duration}
+    unit_of_measurement: s
+    mode: box
+    entity_category: config
+
+button:
+  - platform: template
+    name: "Log BLE address"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          uint8_t mac[6];
+          esp_read_mac(mac, ESP_MAC_BT);
+          ESP_LOGI("oras", "BLE address: %02X:%02X:%02X:%02X:%02X:%02X",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+## ---------------------------------------------------------------------------
+## Entities
+## ---------------------------------------------------------------------------
+
+binary_sensor:
+  - platform: template
+    id: valve_open
+    name: "Valve open"
+    device_class: opening
+
+sensor:
+  - platform: template
+    id: unit_rssi
+    name: "Control unit signal"
+    unit_of_measurement: dBm
+    accuracy_decimals: 0
+    device_class: signal_strength
+    entity_category: diagnostic
+
+  - platform: template
+    id: pad_batt
+    name: "Press pad battery raw"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters:
+      # Raw voltage proxy, not a percentage. It sags under transmit load,
+      # so take a median rather than trusting a single sample.
+      - median:
+          window_size: 7
+          send_every: 7
+
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 120s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: pad_cmd
+    name: "Last pad command"
+    entity_category: diagnostic
+
+  - platform: version
+    name: "ESPHome version"
+    entity_category: diagnostic
